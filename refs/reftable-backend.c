@@ -1637,7 +1637,6 @@ struct reftable_reflog_iterator {
 	struct reftable_ref_store *refs;
 	struct reftable_iterator iter;
 	struct reftable_log_record log;
-	struct object_id oid;
 	char *last_name;
 	int err;
 };
@@ -1648,8 +1647,6 @@ static int reftable_reflog_iterator_advance(struct ref_iterator *ref_iterator)
 		(struct reftable_reflog_iterator *)ref_iterator;
 
 	while (!iter->err) {
-		int flags;
-
 		iter->err = reftable_iterator_next_log(&iter->iter, &iter->log);
 		if (iter->err)
 			break;
@@ -1662,17 +1659,13 @@ static int reftable_reflog_iterator_advance(struct ref_iterator *ref_iterator)
 		if (iter->last_name && !strcmp(iter->log.refname, iter->last_name))
 			continue;
 
-		if (!refs_resolve_ref_unsafe(&iter->refs->base, iter->log.refname,
-					     0, &iter->oid, &flags)) {
-			error(_("bad ref for %s"), iter->log.refname);
+		if (check_refname_format(iter->log.refname,
+					 REFNAME_ALLOW_ONELEVEL))
 			continue;
-		}
 
 		free(iter->last_name);
 		iter->last_name = xstrdup(iter->log.refname);
 		iter->base.refname = iter->log.refname;
-		iter->base.oid = &iter->oid;
-		iter->base.flags = flags;
 
 		break;
 	}
@@ -1725,7 +1718,6 @@ static struct reftable_reflog_iterator *reflog_iterator_for_stack(struct reftabl
 	iter = xcalloc(1, sizeof(*iter));
 	base_ref_iterator_init(&iter->base, &reftable_reflog_iterator_vtable, 1);
 	iter->refs = refs;
-	iter->base.oid = &iter->oid;
 
 	ret = refs->err;
 	if (ret)

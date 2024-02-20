@@ -2,9 +2,12 @@
 #include "dir.h"
 #include "iterator.h"
 #include "dir-iterator.h"
+#include "string-list.h"
 
 struct dir_iterator_level {
 	DIR *dir;
+	struct string_list entries;
+	size_t entries_idx;
 
 	/*
 	 * The length of the directory part of path at this level
@@ -72,6 +75,40 @@ static int push_level(struct dir_iterator_int *iter)
 		return -1;
 	}
 
+	string_list_init_dup(&level->entries);
+	level->entries_idx = 0;
+
+	/*
+	 * When the iterator is sorted we read and sort all directory entries
+	 * directly.
+	 */
+	if (iter->flags & DIR_ITERATOR_SORTED) {
+		while (1) {
+			struct dirent *de;
+
+			errno = 0;
+			de = readdir(level->dir);
+			if (!de) {
+				if (errno && errno != ENOENT) {
+					warning_errno("error reading directory '%s'",
+						      iter->base.path.buf);
+					return -1;
+				}
+
+				break;
+			}
+
+			if (is_dot_or_dotdot(de->d_name))
+				continue;
+
+			string_list_append(&level->entries, de->d_name);
+		}
+		string_list_sort(&level->entries);
+
+		closedir(level->dir);
+		level->dir = NULL;
+	}
+
 	return 0;
 }
 
@@ -88,21 +125,22 @@ static int pop_level(struct dir_iterator_int *iter)
 		warning_errno("error closing directory '%s'",
 			      iter->base.path.buf);
 	level->dir = NULL;
+	string_list_clear(&level->entries, 0);
 
 	return --iter->levels_nr;
 }
 
 /*
  * Populate iter->base with the necessary information on the next iteration
- * entry, represented by the given dirent de. Return 0 on success and -1
+ * entry, represented by the given name. Return 0 on success and -1
  * otherwise, setting errno accordingly.
  */
 static int prepare_next_entry_data(struct dir_iterator_int *iter,
-				   struct dirent *de)
+				   const char *name)
 {
 	int err, saved_errno;
 
-	strbuf_addstr(&iter->base.path, de->d_name);
+	strbuf_addstr(&iter->base.path, name);
 	/*
 	 * We have to reset these because the path strbuf might have
 	 * been realloc()ed at the previous strbuf_addstr().
@@ -136,30 +174,43 @@ int dir_iterator_advance(struct dir_iterator *dir_iterator)
 
 	/* Loop until we find an entry that we can give back to the caller. */
 	while (1) {
-		struct dirent *de;
 		struct dir_iterator_level *level =
 			&iter->levels[iter->levels_nr - 1];
+		struct dirent *de;
+		const char *name;
 
 		strbuf_setlen(&iter->base.path, level->prefix_len);
-		errno = 0;
-		de = readdir(level->dir);
 
-		if (!de) {
-			if (errno) {
-				warning_errno("error reading directory '%s'",
-					      iter->base.path.buf);
-				if (iter->flags & DIR_ITERATOR_PEDANTIC)
-					goto error_out;
-			} else if (pop_level(iter) == 0) {
-				return dir_iterator_abort(dir_iterator);
+		if (level->dir) {
+			errno = 0;
+			de = readdir(level->dir);
+			if (!de) {
+				if (errno) {
+					warning_errno("error reading directory '%s'",
+						      iter->base.path.buf);
+					if (iter->flags & DIR_ITERATOR_PEDANTIC)
+						goto error_out;
+				} else if (pop_level(iter) == 0) {
+					return dir_iterator_abort(dir_iterator);
+				}
+				continue;
 			}
-			continue;
+
+			if (is_dot_or_dotdot(de->d_name))
+				continue;
+
+			name = de->d_name;
+		} else {
+			if (level->entries_idx >= level->entries.nr) {
+				if (pop_level(iter) == 0)
+					return dir_iterator_abort(dir_iterator);
+				continue;
+			}
+
+			name = level->entries.items[level->entries_idx++].string;
 		}
 
-		if (is_dot_or_dotdot(de->d_name))
-			continue;
-
-		if (prepare_next_entry_data(iter, de)) {
+		if (prepare_next_entry_data(iter, name)) {
 			if (errno != ENOENT && iter->flags & DIR_ITERATOR_PEDANTIC)
 				goto error_out;
 			continue;
@@ -188,6 +239,8 @@ int dir_iterator_abort(struct dir_iterator *dir_iterator)
 			warning_errno("error closing directory '%s'",
 				      iter->base.path.buf);
 		}
+
+		string_list_clear(&level->entries, 0);
 	}
 
 	free(iter->levels);
