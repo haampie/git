@@ -5,6 +5,7 @@
 #include "ewah/ewok.h"
 #include "fsmonitor.h"
 #include "fsmonitor-ipc.h"
+#include "name-hash.h"
 #include "run-command.h"
 #include "strbuf.h"
 #include "trace2.h"
@@ -183,79 +184,304 @@ static int query_fsmonitor_hook(struct repository *r,
 	return result;
 }
 
+static int fsmonitor_refresh_callback_slash(
+	struct index_state *istate, const char *name, int len, int pos);
+
+/*
+ * Invalidate the untracked cache for the given pathname.  Copy the
+ * buffer to a proper null-terminated string (since the untracked
+ * cache code does not use (buf, len) style argument).  Also strip any
+ * trailing slash.
+ */
+static void my_invalidate_untracked_cache(
+	struct index_state *istate, const char *name, int len)
+{
+	struct strbuf work_path = STRBUF_INIT;
+
+	if (!len)
+		return;
+
+	if (name[len-1] == '/')
+		len--;
+
+	strbuf_add(&work_path, name, len);
+	untracked_cache_invalidate_path(istate, work_path.buf, 0);
+	strbuf_release(&work_path);
+}
+
+/*
+ * Invalidate the FSM bit on this CE.  This is like mark_fsmonitor_invalid()
+ * but we've already handled the untracked-cache and I want a different
+ * trace message.
+ */
+static void my_invalidate_ce_fsm(struct cache_entry *ce)
+{
+	if (ce->ce_flags & CE_FSMONITOR_VALID)
+		trace_printf_key(&trace_fsmonitor,
+				 "fsmonitor_refresh_cb_invalidate '%s'",
+				 ce->name);
+	ce->ce_flags &= ~CE_FSMONITOR_VALID;
+}
+
+/*
+ * Use the name-hash to lookup the pathname.
+ *
+ * Returns the number of cache-entries that we invalidated.
+ */
+static int my_callback_name_hash(
+	struct index_state *istate, const char *name, int len)
+{
+	struct cache_entry *ce = NULL;
+
+	ce = index_file_exists(istate, name, len, 1);
+	if (!ce)
+		return 0;
+
+	/*
+	 * The index contains a case-insensitive match for the pathname.
+	 * This could either be a regular file or a sparse-index directory.
+	 *
+	 * We should not have seen FSEvents for a sparse-index directory,
+	 * but we handle it just in case.
+	 *
+	 * Either way, we know that there are not any cache-entries for
+	 * children inside the cone of the directory, so we don't need to
+	 * do the usual scan.
+	 */
+	trace_printf_key(&trace_fsmonitor,
+			 "fsmonitor_refresh_callback map '%s' '%s'",
+			 name, ce->name);
+
+	my_invalidate_untracked_cache(istate, ce->name, ce->ce_namelen);
+
+	my_invalidate_ce_fsm(ce);
+	return 1;
+}
+
+/*
+ * Use the directory name-hash to find the correct-case spelling
+ * of the directory.  Use the canonical spelling to invalidate all
+ * of the cache-entries within the matching cone.
+ *
+ * The pathname MUST NOT have a trailing slash.
+ *
+ * Returns the number of cache-entries that we invalidated.
+ */
+static int my_callback_dir_name_hash(
+	struct index_state *istate, const char *name, int len)
+{
+	struct strbuf canonical_path = STRBUF_INIT;
+	int pos;
+	int nr_in_cone;
+
+	if (!index_dir_exists2(istate, name, len, &canonical_path))
+		return 0; /* name is untracked */
+	if (!memcmp(name, canonical_path.buf, len)) {
+		strbuf_release(&canonical_path);
+		return 0; /* should not happen */
+	}
+
+	trace_printf_key(&trace_fsmonitor,
+			 "fsmonitor_refresh_callback map '%s' '%s'",
+			 name, canonical_path.buf);
+
+	/*
+	 * The directory name-hash only tells us the corrected
+	 * spelling of the prefix.  We have to use this canonical
+	 * path to do a lookup in the cache-entry array so that we
+	 * we repeat the original search using the case-corrected
+	 * spelling.
+	 */
+	strbuf_addch(&canonical_path, '/');
+	pos = index_name_pos(istate, canonical_path.buf,
+			     canonical_path.len);
+	nr_in_cone = fsmonitor_refresh_callback_slash(
+		istate, canonical_path.buf, canonical_path.len, pos);
+	strbuf_release(&canonical_path);
+	return nr_in_cone;
+}
+
+/*
+ * The daemon sent an observed pathname without a trailing slash.
+ * (This is the normal case.)  We do not know if it is a tracked or
+ * untracked file, a sparse-directory, or a populated directory (on a
+ * platform such as Windows where FSEvents are not qualified).
+ *
+ * The pathname contains the observed case reported by the FS. We
+ * do not know it is case-correct or -incorrect.
+ *
+ * Assume it is case-correct and try an exact match.
+ *
+ * Return the number of cache-entries that we invalidated.
+ */
+static int fsmonitor_refresh_callback_unqualified(
+	struct index_state *istate, const char *name, int len, int pos)
+{
+	my_invalidate_untracked_cache(istate, name, len);
+
+	if (pos >= 0) {
+		/*
+		 * An exact match on a tracked file. We assume that we
+		 * do not need to scan forward for a sparse-directory
+		 * cache-entry with the same pathname, nor for a cone
+		 * at that directory. (That is, assume no D/F conflicts.)
+		 */
+		my_invalidate_ce_fsm(istate->cache[pos]);
+		return 1;
+	} else {
+		int nr_in_cone;
+		struct strbuf work_path = STRBUF_INIT;
+
+		/*
+		 * The negative "pos" gives us the suggested insertion
+		 * point for the pathname (without the trailing slash).
+		 * We need to see if there is a directory with that
+		 * prefix, but there can be lots of pathnames between
+		 * "foo" and "foo/" like "foo-" or "foo-bar", so we
+		 * don't want to do our own scan.
+		 */
+		strbuf_add(&work_path, name, len);
+		strbuf_addch(&work_path, '/');
+		pos = index_name_pos(istate, work_path.buf, work_path.len);
+		nr_in_cone = fsmonitor_refresh_callback_slash(
+			istate, work_path.buf, work_path.len, pos);
+		strbuf_release(&work_path);
+		return nr_in_cone;
+	}
+}
+
+/*
+ * On a case-insensitive FS, use the name-hash to map the case of
+ * the observed path to the canonical case expected by the index.
+ *
+ * The given pathname DOES NOT include the trailing slash.
+ *
+ * Return the number of cache-entries that we invalidated.
+ */
+static int fsmonitor_refresh_callback_unqualified_icase(
+	struct index_state *istate, const char *name, int len)
+{
+	int nr_in_cone;
+
+	/*
+	 * Look for a case-incorrect match for this non-directory
+	 * pathname.
+	 */
+	nr_in_cone = my_callback_name_hash(istate, name, len);
+	if (nr_in_cone)
+		return nr_in_cone;
+
+	/*
+	 * Try the directory name-hash and see if there is a
+	 * case-incorrect directory with this pathanme.
+	 * (len) because we don't have a trailing slash.
+	 */
+	nr_in_cone = my_callback_dir_name_hash(istate, name, len);
+	return nr_in_cone;
+}
+
+/*
+ * The daemon can decorate directory events, such as a move or rename,
+ * by adding a trailing slash to the observed name.  Use this to
+ * explicitly invalidate the entire cone under that directory.
+ *
+ * The daemon can only reliably do that if the OS FSEvent contains
+ * sufficient information in the event.
+ *
+ * macOS FSEvents have enough information.
+ *
+ * Other platforms may or may not be able to do it (and it might
+ * depend on the type of event (for example, a daemon could lstat() an
+ * observed pathname after a rename, but not after a delete)).
+ *
+ * If we find an exact match in the index for a path with a trailing
+ * slash, it means that we matched a sparse-index directory in a
+ * cone-mode sparse-checkout (since that's the only time we have
+ * directories in the index).  We should never see this in practice
+ * (because sparse directories should not be present and therefore
+ * not generating FS events).  Either way, we can treat them in the
+ * same way and just invalidate the cache-entry and the untracked
+ * cache (and in this case, the forward cache-entry scan won't find
+ * anything and it doesn't hurt to let it run).
+ *
+ * Return the number of cache-entries that we invalidated.  We will
+ * use this later to determine if we need to attempt a second
+ * case-insensitive search.  That is, if a observed-case search yields
+ * any results, we assume the prefix is case-correct.  If there are
+ * no matches, we still don't know if the observed path is simply
+ * untracked or case-incorrect.
+ */
+static int fsmonitor_refresh_callback_slash(
+	struct index_state *istate, const char *name, int len, int pos)
+{
+	int i;
+	int nr_in_cone = 0;
+
+	my_invalidate_untracked_cache(istate, name, len);
+
+	if (pos < 0)
+		pos = -pos - 1;
+
+	/* Mark all entries for the folder invalid */
+	for (i = pos; i < istate->cache_nr; i++) {
+		if (!starts_with(istate->cache[i]->name, name))
+			break;
+		my_invalidate_ce_fsm(istate->cache[i]);
+		nr_in_cone++;
+	}
+
+	return nr_in_cone;
+}
+
+/*
+ * On a case-insensitive FS, use the name-hash and directory name-hash
+ * to map the case of the observed path to the canonical case expected
+ * by the index.
+ *
+ * The given pathname includes the trailing slash.
+ *
+ * Return the number of cache-entries that we invalidated.
+ */
+static int fsmonitor_refresh_callback_slash_icase(
+	struct index_state *istate, const char *name, int len)
+{
+	int nr_in_cone;
+
+	/*
+	 * Look for a case-incorrect sparse-index directory.
+	 */
+	nr_in_cone = my_callback_name_hash(istate, name, len);
+	if (nr_in_cone)
+		return nr_in_cone;
+
+	/*
+	 * (len-1) because we do not include the trailing slash in the
+	 * pathname.
+	 */
+	nr_in_cone = my_callback_dir_name_hash(istate, name, len-1);
+	return nr_in_cone;
+}
+
 static void fsmonitor_refresh_callback(struct index_state *istate, char *name)
 {
-	int i, len = strlen(name);
+	int len = strlen(name);
 	int pos = index_name_pos(istate, name, len);
+	int nr_in_cone;
+
 
 	trace_printf_key(&trace_fsmonitor,
 			 "fsmonitor_refresh_callback '%s' (pos %d)",
 			 name, pos);
 
 	if (name[len - 1] == '/') {
-		/*
-		 * The daemon can decorate directory events, such as
-		 * moves or renames, with a trailing slash if the OS
-		 * FS Event contains sufficient information, such as
-		 * MacOS.
-		 *
-		 * Use this to invalidate the entire cone under that
-		 * directory.
-		 *
-		 * We do not expect an exact match because the index
-		 * does not normally contain directory entries, so we
-		 * start at the insertion point and scan.
-		 */
-		if (pos < 0)
-			pos = -pos - 1;
-
-		/* Mark all entries for the folder invalid */
-		for (i = pos; i < istate->cache_nr; i++) {
-			if (!starts_with(istate->cache[i]->name, name))
-				break;
-			istate->cache[i]->ce_flags &= ~CE_FSMONITOR_VALID;
-		}
-
-		/*
-		 * We need to remove the traling "/" from the path
-		 * for the untracked cache.
-		 */
-		name[len - 1] = '\0';
-	} else if (pos >= 0) {
-		/*
-		 * We have an exact match for this path and can just
-		 * invalidate it.
-		 */
-		istate->cache[pos]->ce_flags &= ~CE_FSMONITOR_VALID;
+		nr_in_cone = fsmonitor_refresh_callback_slash(istate, name, len, pos);
+		if (ignore_case && !nr_in_cone)
+			fsmonitor_refresh_callback_slash_icase(istate, name, len);
 	} else {
-		/*
-		 * The path is not a tracked file -or- it is a
-		 * directory event on a platform that cannot
-		 * distinguish between file and directory events in
-		 * the event handler, such as Windows.
-		 *
-		 * Scan as if it is a directory and invalidate the
-		 * cone under it.  (But remember to ignore items
-		 * between "name" and "name/", such as "name-" and
-		 * "name.".
-		 */
-		pos = -pos - 1;
-
-		for (i = pos; i < istate->cache_nr; i++) {
-			if (!starts_with(istate->cache[i]->name, name))
-				break;
-			if ((unsigned char)istate->cache[i]->name[len] > '/')
-				break;
-			if (istate->cache[i]->name[len] == '/')
-				istate->cache[i]->ce_flags &= ~CE_FSMONITOR_VALID;
-		}
+		nr_in_cone = fsmonitor_refresh_callback_unqualified(istate, name, len, pos);
+		if (ignore_case && !nr_in_cone)
+			fsmonitor_refresh_callback_unqualified_icase(istate, name, len);
 	}
-
-	/*
-	 * Mark the untracked cache dirty even if it wasn't found in the index
-	 * as it could be a new untracked file.
-	 */
-	untracked_cache_invalidate_path(istate, name, 0);
 }
 
 /*
