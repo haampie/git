@@ -8,6 +8,8 @@ static char *host;
 static char *path;
 static char *username;
 static char *password;
+static char *password_expiry_utc;
+static char *oauth_refresh_token;
 static UInt16 port;
 
 __attribute__((format (printf, 1, 2)))
@@ -20,6 +22,17 @@ static void die(const char *err, ...)
 	fprintf(stderr, "%s\n", msg);
 	va_end(params);
 	exit(1);
+}
+
+
+static void *xmalloc(size_t size)
+{
+	void *ret = malloc(size);
+	if (!ret && !size)
+		ret = malloc(1);
+	if (!ret)
+		 die("Out of memory");
+	return ret;
 }
 
 static void *xstrdup(const char *s1)
@@ -69,11 +82,27 @@ static void find_internet_password(void)
 	void *buf;
 	UInt32 len;
 	SecKeychainItemRef item;
+	char *line;
+	char *remaining_lines;
+	char *part;
+	char *remaining_parts;
 
 	if (SecKeychainFindInternetPassword(KEYCHAIN_ARGS, &len, &buf, &item))
 		return;
 
-	write_item("password", buf, len);
+	line = strtok_r(buf, "\n", &remaining_lines);
+	write_item("password", line, strlen(line));
+	while(line != NULL) {
+		part = strtok_r(line, "=", &remaining_parts);
+		if (!strcmp(part, "oauth_refresh_token")) {
+			write_item("oauth_refresh_token", remaining_parts, strlen(remaining_parts));
+		}
+		if (!strcmp(part, "password_expiry_utc")) {
+			write_item("password_expiry_utc", remaining_parts, strlen(remaining_parts));
+		}
+		line = strtok_r(NULL, "\n", &remaining_lines);
+	}
+
 	if (!username)
 		find_username_in_item(item);
 
@@ -100,13 +129,32 @@ static void delete_internet_password(void)
 
 static void add_internet_password(void)
 {
+	int len;
+
 	/* Only store complete credentials */
 	if (!protocol || !host || !username || !password)
 		return;
 
+	char *secret;
+	if (password_expiry_utc && oauth_refresh_token) {
+		len = strlen(password) + strlen(password_expiry_utc) + strlen(oauth_refresh_token) + strlen("\npassword_expiry_utc=\noauth_refresh_token=");
+		secret = xmalloc(len);
+		snprintf(secret, len, len, "%s\npassword_expiry_utc=%s\noauth_refresh_token=%s", password, oauth_refresh_token);
+	} else if (oauth_refresh_token) {
+		len = strlen(password) + strlen(oauth_refresh_token) + strlen("\noauth_refresh_token=");
+		secret = xmalloc(len);
+		snprintf(secret, len, len, "%s\noauth_refresh_token=%s", password, oauth_refresh_token);
+	} else if (password_expiry_utc) {
+		len = strlen(password) + strlen(password_expiry_utc) + strlen("\npassword_expiry_utc=");
+		secret = xmalloc(len);
+		snprintf(secret, len, len, "%s\npassword_expiry_utc=%s", password, password_expiry_utc);
+	} else {
+		secret = xstrdup(password);
+	}
+
 	if (SecKeychainAddInternetPassword(
 	      KEYCHAIN_ARGS,
-	      KEYCHAIN_ITEM(password),
+	      KEYCHAIN_ITEM(secret),
 	      NULL))
 		return;
 }
@@ -161,6 +209,10 @@ static void read_credential(void)
 			username = xstrdup(v);
 		else if (!strcmp(buf, "password"))
 			password = xstrdup(v);
+		else if (!strcmp(buf, "password_expiry_utc"))
+			password_expiry_utc = xstrdup(v);
+		else if (!strcmp(buf, "oauth_refresh_token"))
+			oauth_refresh_token = xstrdup(v);
 		/*
 		 * Ignore other lines; we don't know what they mean, but
 		 * this future-proofs us when later versions of git do
